@@ -1,0 +1,231 @@
+// load specific library branch
+if (!params.LIBRARY_BRANCH) {
+    error 'LIBRARY_BRANCH parameter is required to start the test pipeline'
+}
+echo "Jenkins library branch ${params.LIBRARY_BRANCH} will be used to build."
+def lib = library("jenkins-library@${params.LIBRARY_BRANCH}").org.zowe.jenkins_shared_library
+
+// global var for JFrogArtifactory object
+def jfrog
+
+// test constants
+String testLocalArtifact  = ".tmp-artifact"
+String testRemoteArtifact = "test-artifactory-upload.txt"
+Integer testPropValue     = 1
+String snapshotArtifact   = "libs-snapshot-local/org/zowe/jenkins-library-test/${testRemoteArtifact}"
+String releaseFolder      = "libs-release-local/org/zowe/jenkins-library-test/"
+
+node ('zowe-jenkins-agent') {
+    /**
+     * Initialize JFrogArtifactory object
+     */
+    stage('init') {
+        // init artifactory
+        jfrog = lib.artifact.JFrogArtifactory.new(this)
+        if (!jfrog) {
+            error 'Failed to initialize JFrogArtifactory instance.'
+        }
+        jfrog.init([
+            'url'                        : env.ARTIFACTORY_URL,
+            'usernamePasswordCredential' : env.ARTIFACTORY_CREDENTIAL,
+        ])
+
+        echo "[JFROG_ARTIFACTORY_TEST] init successfully"
+    }
+
+    /**
+     * Should be able to get artifact information
+     */
+    stage('getArtifact') {
+        String pattern             = 'libs-release-local/org/zowe/1.9.0/zowe-1.9.0.pax'
+        String expectedBuildName   = 'zowe-promote-publish :: staging'
+        String expectedBuildNumber = '24'
+
+        // get artifact
+        Map artifact = jfrog.getArtifact(pattern)
+
+        // validate resolved artifact path
+        if (!artifact || !artifact['path']) {
+            error "Failed to find \"${pattern}\""
+        }
+
+        // validate build name
+        if (!artifact || !artifact['build.name'] || artifact['build.name'] != expectedBuildName) {
+            error "Artifact build name \"${artifact['build.name']}\" is not expected as \"${expectedBuildName}\"."
+        }
+
+        // validate build number
+        if (!artifact || !artifact['build.number'] || artifact['build.number'] != expectedBuildNumber) {
+            error "Artifact build number \"${artifact['build.number']}\" is not expected as \"${expectedBuildNumber}\"."
+        }
+
+        echo "[JFROG_ARTIFACTORY_TEST] getArtifact successfully"
+    }
+
+    /**
+     * Should be able to get build information
+     */
+    stage('getBuildInfo') {
+        // this is parent build of `libs-release-local/org/zowe/1.9.0/zowe-1.9.0.pax`
+        String buildName           = 'zowe-install-packaging :: master'
+        String buildNumber         = '803'
+        String expectedVcsRevision = '840b9c532f434fa0d1488378b2a9b201d0c03f41'
+
+        // get buildInfo with vcsKeyword
+        Map build_keyword = jfrog.getBuildInfo(buildName, buildNumber, 'zowe-install-packaging')
+        // validate resolved build_keyword name
+        if (!build_keyword || !build_keyword['name']) {
+            error "Failed to find \"${buildName}/${buildNumber}\""
+        }
+        // validate build_keyword name
+        if (!build_keyword || !build_keyword['name'] || build_keyword['name'] != buildName) {
+            error "build_keyword name \"${build_keyword['name']}\" is not expected as \"${buildName}\"."
+        }
+        // validate build_keyword vcsRevision
+        if (!build_keyword || !build_keyword['vcsRevision'] || build_keyword['vcsRevision'] != expectedVcsRevision) {
+            error "build_keyword vcsRevision \"${build_keyword['vcsRevision']}\" is not expected as \"${expectedVcsRevision}\"."
+        }
+
+        echo "[JFROG_ARTIFACTORY_TEST] getBuildInfo successfully"
+    }
+
+    /**
+     * Should be able to download artifacts
+     */
+    stage('download') {
+        String downloadFolder = ".tmp-artifacts"
+        String spec = """{
+    "files": [
+        {
+            "pattern": "libs-release-local/org/zowe/explorer-jes/1.0.*/explorer-jes-1.0.*.pax",
+            "target": "${downloadFolder}/",
+            "flat": "true",
+            "sortBy": ["created"],
+            "sortOrder": "desc",
+            "limit": 1
+        },
+        {
+            "pattern": "libs-release-local/org/zowe/explorer-mvs/1.0.*/explorer-mvs-1.0.*.pax",
+            "target": "${downloadFolder}/",
+            "flat": "true",
+            "sortBy": ["created"],
+            "sortOrder": "desc",
+            "limit": 1
+        }
+    ]
+}
+"""
+        Integer expected = 2
+
+        // download the artifacts
+        jfrog.download(specContent: spec, expected: expected)
+
+        // verify downloaded files
+        def downloaded = sh(
+            script: "ls -1 ${downloadFolder} | wc -l",
+            returnStdout: true
+        ).trim()
+        if (downloaded != "${expected}") {
+            error "Failed to download expected artifacts: downloaded=${downloaded}, expected=${expected}."
+        }
+
+        echo "[JFROG_ARTIFACTORY_TEST] download successfully"
+    }
+
+    /**
+     * Should be able to check expected downloads
+     */
+    stage('expected-download') {
+        String downloadFolder = ".tmp-artifacts"
+        // clean up from last stage
+        sh "rm -fr ${downloadFolder} || true"
+        String spec = """{
+    "files": [
+        {
+            "pattern": "libs-release-local/org/zowe/explorer-jes/1.0.*/explorer-jes-1.0.*.pax",
+            "target": "${downloadFolder}/",
+            "flat": "true",
+            "sortBy": ["created"],
+            "sortOrder": "desc",
+            "limit": 1
+        },
+        {
+            "pattern": "libs-release-local/org/zowe/explorer-mvs/1.0.*/does-not-exists-1.0.*.pax.Z",
+            "target": "${downloadFolder}/",
+            "flat": "true",
+            "sortBy": ["created"],
+            "sortOrder": "desc",
+            "limit": 1
+        }
+    ]
+}
+"""
+        Integer expected = 2
+        Integer realExpected = 1
+        String expectFailure = "Expected ${expected} artifact(s) to be downloaded but only got ${realExpected}.".toString()
+
+        // download the artifacts
+        String err = ''
+        try {
+            jfrog.download(specContent: spec, expected: expected)
+        } catch (e) {
+            err = "${e}".toString()
+            echo "Catched error: ${err}"
+        }
+
+        if (!err.contains(expectFailure)) {
+            error "Failed to validate expected artifacts."
+        }
+
+        // verify downloaded files
+        def downloaded = sh(
+            script: "ls -1 ${downloadFolder} | wc -l",
+            returnStdout: true
+        ).trim()
+        if (downloaded != "${realExpected}") {
+            error "Failed to download expected artifacts: downloaded=${downloaded}, realExpected=${realExpected}."
+        }
+
+        echo "[JFROG_ARTIFACTORY_TEST] expected-download successfully"
+    }
+
+    /**
+     * Should be able to upload artifact
+     */
+    stage('upload') {
+        // prepare artifact
+        sh "echo test > ${testLocalArtifact}"
+
+        // upload the artifact
+        jfrog.upload(testLocalArtifact, snapshotArtifact, [
+            'test.key': testPropValue
+        ])
+
+        // get artifact
+        Map artifact = jfrog.getArtifact(snapshotArtifact)
+        // NOTE: property value should be converted to string
+        if (!artifact || artifact['test.key'] != "${testPropValue}") {
+            error 'Artifact property "test.key" is not set correctly.'
+        }
+
+        echo "[JFROG_ARTIFACTORY_TEST] upload successfully"
+    }
+
+    /**
+     * Should be able to promote artifact
+     *
+     * Will use artifact uploaded from upload stage
+     */
+    stage('promote') {
+        def ts = lib.Utils.getTimestamp()
+        releaseFolder += ts + '/'
+
+        def result = jfrog.promote(snapshotArtifact, releaseFolder)
+
+        if (result != "${releaseFolder}${testRemoteArtifact}") {
+            error "Promote result \"${result}\" is not as expected \"${releaseFolder}${testRemoteArtifact}\"."
+        }
+
+        echo "[JFROG_ARTIFACTORY_TEST] promote successfully"
+    }
+}
